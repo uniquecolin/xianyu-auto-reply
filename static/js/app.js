@@ -5427,6 +5427,18 @@ async function checkAuth() {
         if (loginInfoSettings) {
         loginInfoSettings.style.display = 'flex';
         }
+
+        const riskControlSettings = document.getElementById('risk-control-settings');
+        if (riskControlSettings) {
+        riskControlSettings.style.display = 'block';
+        }
+
+        await loadRiskControlNightSettings();
+    } else {
+        const riskControlSettings = document.getElementById('risk-control-settings');
+        if (riskControlSettings) {
+        riskControlSettings.style.display = 'none';
+        }
     }
 
     return true;
@@ -13930,6 +13942,7 @@ async function loadSystemSettings() {
             // 显示/隐藏管理员专用设置（仅管理员可见）
             const apiSecuritySettings = document.getElementById('api-security-settings');
             const loginInfoSettings = document.getElementById('login-info-settings');
+            const riskControlSettings = document.getElementById('risk-control-settings');
             const outgoingConfigs = document.getElementById('outgoing-configs');
             const backupManagement = document.getElementById('backup-management');
             const systemRestartBtn = document.getElementById('system-restart-btn');
@@ -13940,6 +13953,9 @@ async function loadSystemSettings() {
             }
             if (loginInfoSettings) {
                 loginInfoSettings.style.display = isAdmin ? 'flex' : 'none';
+            }
+            if (riskControlSettings) {
+                riskControlSettings.style.display = isAdmin ? 'block' : 'none';
             }
             if (outgoingConfigs) {
                 outgoingConfigs.style.display = isAdmin ? 'block' : 'none';
@@ -13960,6 +13976,7 @@ async function loadSystemSettings() {
                 await loadAPISecuritySettings();
                 await loadRegistrationSettings();
                 await loadLoginInfoSettings();
+                await loadRiskControlNightSettings();
                 await loadOutgoingConfigs();
             }
         }
@@ -13967,9 +13984,13 @@ async function loadSystemSettings() {
         console.error('获取用户信息失败:', error);
         // 出错时隐藏管理员功能
         const loginInfoSettings = document.getElementById('login-info-settings');
+        const riskControlSettings = document.getElementById('risk-control-settings');
         const dashboardHotUpdateGroup = document.getElementById('dashboardHotUpdateGroup');
         if (loginInfoSettings) {
             loginInfoSettings.style.display = 'none';
+        }
+        if (riskControlSettings) {
+            riskControlSettings.style.display = 'none';
         }
         if (dashboardHotUpdateGroup) {
             dashboardHotUpdateGroup.style.display = 'none';
@@ -13999,6 +14020,104 @@ async function loadAPISecuritySettings() {
     } catch (error) {
         console.error('加载API安全设置失败:', error);
         showToast('加载API安全设置失败', 'danger');
+    }
+}
+
+async function loadRiskControlNightSettings() {
+    try {
+        const response = await fetch('/system-settings', {
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error('加载夜间风控降频设置失败');
+        }
+
+        const settings = await response.json();
+        const enabledInput = document.getElementById('riskControlNightModeEnabled');
+        const startHourInput = document.getElementById('riskControlNightStartHour');
+        const endHourInput = document.getElementById('riskControlNightEndHour');
+
+        if (enabledInput) {
+            enabledInput.checked = settings.risk_control_night_mode_enabled === 'true';
+        }
+        if (startHourInput) {
+            startHourInput.value = settings.risk_control_night_start_hour || '1';
+        }
+        if (endHourInput) {
+            endHourInput.value = settings.risk_control_night_end_hour || '6';
+        }
+    } catch (error) {
+        console.error('加载夜间风控降频设置失败:', error);
+        showToast('加载夜间风控降频设置失败', 'danger');
+    }
+}
+
+async function saveRiskControlNightSettings() {
+    const enabledInput = document.getElementById('riskControlNightModeEnabled');
+    const startHourInput = document.getElementById('riskControlNightStartHour');
+    const endHourInput = document.getElementById('riskControlNightEndHour');
+    const statusBox = document.getElementById('riskControlNightSettingsStatus');
+
+    if (!enabledInput || !startHourInput || !endHourInput) {
+        return;
+    }
+
+    const startHour = Number.parseInt(startHourInput.value, 10);
+    const endHour = Number.parseInt(endHourInput.value, 10);
+    if (Number.isNaN(startHour) || startHour < 0 || startHour > 23 || Number.isNaN(endHour) || endHour < 0 || endHour > 23) {
+        showToast('夜间时间必须填写 0-23 的整数小时', 'warning');
+        return;
+    }
+
+    const payloads = [
+        {
+            key: 'risk_control_night_mode_enabled',
+            value: enabledInput.checked ? 'true' : 'false',
+            description: '是否启用夜间风控降频',
+        },
+        {
+            key: 'risk_control_night_start_hour',
+            value: String(startHour),
+            description: '夜间风控降频开始小时',
+        },
+        {
+            key: 'risk_control_night_end_hour',
+            value: String(endHour),
+            description: '夜间风控降频结束小时',
+        }
+    ];
+
+    try {
+        for (const item of payloads) {
+            const response = await fetch(`/system-settings/${item.key}`, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${authToken}`
+                },
+                body: JSON.stringify({
+                    value: item.value,
+                    description: item.description,
+                })
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `保存 ${item.key} 失败`);
+            }
+        }
+
+        if (statusBox) {
+            statusBox.textContent = `夜间风控降频设置已保存：${enabledInput.checked ? '开启' : '关闭'}，区间 ${String(startHour).padStart(2, '0')}:00 - ${String(endHour).padStart(2, '0')}:00`;
+            statusBox.classList.remove('d-none');
+        }
+        showToast('夜间风控降频设置已保存', 'success');
+    } catch (error) {
+        console.error('保存夜间风控降频设置失败:', error);
+        showToast(`保存夜间风控降频设置失败: ${error.message || '未知错误'}`, 'danger');
     }
 }
 

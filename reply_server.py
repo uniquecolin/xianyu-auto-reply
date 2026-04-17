@@ -2442,6 +2442,34 @@ class SystemSettingIn(BaseModel):
     description: Optional[str] = None
 
 
+NIGHT_MODE_SYSTEM_SETTING_KEYS = {
+    'risk_control_night_mode_enabled',
+    'risk_control_night_start_hour',
+    'risk_control_night_end_hour',
+}
+
+
+def _validate_system_setting_value(key: str, value: str) -> str:
+    if key == 'risk_control_night_mode_enabled':
+        normalized = str(value).strip().lower()
+        if normalized in {'true', '1', 'yes', 'on'}:
+            return 'true'
+        if normalized in {'false', '0', 'no', 'off'}:
+            return 'false'
+        raise HTTPException(status_code=400, detail='夜间降频开关只能为 true 或 false')
+
+    if key in {'risk_control_night_start_hour', 'risk_control_night_end_hour'}:
+        try:
+            hour = int(str(value).strip())
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail='夜间时间必须是 0-23 的整数')
+        if hour < 0 or hour > 23:
+            raise HTTPException(status_code=400, detail='夜间时间必须是 0-23 的整数')
+        return str(hour)
+
+    return value
+
+
 class SystemSettingCreateIn(BaseModel):
     key: str
     value: str
@@ -6458,7 +6486,12 @@ def update_system_setting(key: str, setting_data: SystemSettingIn, current_user:
         if key == 'admin_password_hash':
             raise HTTPException(status_code=400, detail='请使用密码修改接口')
 
-        success = db_manager.set_system_setting(key, setting_data.value, setting_data.description)
+        value = _validate_system_setting_value(key, setting_data.value)
+
+        if key in NIGHT_MODE_SYSTEM_SETTING_KEYS and not current_user.get('is_admin'):
+            raise HTTPException(status_code=403, detail='仅管理员可修改夜间风控降频设置')
+
+        success = db_manager.set_system_setting(key, value, setting_data.description)
         if success:
             return {'msg': 'system setting updated'}
         else:

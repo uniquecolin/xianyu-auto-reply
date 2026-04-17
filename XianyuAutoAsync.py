@@ -8,6 +8,7 @@ import os
 import random
 import secrets
 import threading
+from datetime import datetime
 from enum import Enum
 from urllib.parse import parse_qs, urlparse
 from loguru import logger
@@ -21,7 +22,7 @@ from config import (
     TOKEN_REFRESH_INTERVAL, TOKEN_RETRY_INTERVAL,
     SESSION_KEEPALIVE_INTERVAL, SESSION_KEEPALIVE_RETRY_INTERVAL, COOKIES_STR,
     LOG_CONFIG, AUTO_REPLY, DEFAULT_HEADERS, WEBSOCKET_HEADERS,
-    APP_CONFIG, API_ENDPOINTS, YIFAN_API
+    APP_CONFIG, API_ENDPOINTS, YIFAN_API, RISK_CONTROL
 )
 # from app.logging_config import setup_logging  # 已移除，模块不存在
 import sys
@@ -654,12 +655,129 @@ class XianyuLive:
         """设置密码登录失败后的退避时间"""
         if not cookie_id or seconds <= 0:
             return
+        previous_state = cls._password_login_failure_backoff.get(cookie_id) or {}
+        previous_reason = previous_state.get('reason')
+        previous_count = int(previous_state.get('consecutive_count', 0) or 0)
+        consecutive_count = previous_count + 1 if previous_reason == reason else 1
+        escalation_factor = float(RISK_CONTROL.get('backoff_escalation_factor', 1.5) or 1.5)
+        max_cap = max(seconds, int(RISK_CONTROL.get('backoff_max_cap_seconds', 3600) or 3600))
+        actual_seconds = int(round(min(seconds * (escalation_factor ** max(0, consecutive_count - 1)), max_cap)))
+        actual_seconds = max(seconds, actual_seconds)
+        now = time.time()
         cls._password_login_failure_backoff[cookie_id] = {
-            'until': time.time() + seconds,
+            'until': now + actual_seconds,
             'reason': reason,
-            'seconds': seconds,
-            'created_at': time.time(),
+            'seconds': actual_seconds,
+            'base_seconds': seconds,
+            'consecutive_count': consecutive_count,
+            'created_at': now,
         }
+
+    @staticmethod
+    def _is_counted_password_login_failure_reason(reason: str) -> bool:
+        return str(reason or '').strip() in {'slider_failed', 'risk_control'}
+
+    def _get_night_mode_settings(self) -> Dict[str, Any]:
+        from config import config
+
+        def _setting_value(system_key: str, config_key: str, default: Any) -> Any:
+            raw_value = db_manager.get_system_setting(system_key)
+            if raw_value is None:
+                return RISK_CONTROL.get(config_key, config.get(f'RISK_CONTROL.{config_key}', default))
+            return raw_value
+
+        enabled_raw = _setting_value('risk_control_night_mode_enabled', 'night_mode_enabled', False)
+        start_raw = _setting_value('risk_control_night_start_hour', 'night_start_hour', 1)
+        end_raw = _setting_value('risk_control_night_end_hour', 'night_end_hour', 6)
+
+        def _to_bool(value: Any, default: bool = False) -> bool:
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return default
+            return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+        def _to_hour(value: Any, default: int) -> int:
+            try:
+                return max(0, min(23, int(value)))
+            except (TypeError, ValueError):
+                return default
+
+        return {
+            'enabled': _to_bool(enabled_raw, False),
+            'start_hour': _to_hour(start_raw, 1),
+            'end_hour': _to_hour(end_raw, 6),
+        }
+
+    def _is_in_night_mode_window(self, local_hour: Optional[int] = None) -> bool:
+        settings = self._get_night_mode_settings()
+        if not settings.get('enabled'):
+            return False
+
+        current_hour = datetime.now().hour if local_hour is None else int(local_hour)
+        start_hour = int(settings.get('start_hour', 1))
+        end_hour = int(settings.get('end_hour', 6))
+        if start_hour == end_hour:
+            return True
+        if start_hour < end_hour:
+            return start_hour <= current_hour < end_hour
+        return current_hour >= start_hour or current_hour < end_hour
+
+    def _get_effective_keepalive_interval(self) -> int:
+        base_interval = max(60, int(self.session_keepalive_interval or 600))
+        if not self._is_in_night_mode_window():
+            return base_interval
+        multiplier = max(1, int(RISK_CONTROL.get('night_keepalive_multiplier', 3) or 3))
+        return base_interval * multiplier
+
+    def _get_effective_cookie_refresh_interval(self) -> int:
+        base_interval = max(60, int(self.cookie_refresh_interval or 10800))
+        if not self._is_in_night_mode_window():
+            return base_interval
+        multiplier = max(1, int(RISK_CONTROL.get('night_cookie_refresh_multiplier', 2) or 2))
+        return base_interval * multiplier
+
+    def _compute_token_retry_wait_seconds(self, current_time: Optional[float] = None) -> int:
+        current_time = current_time or time.time()
+        min_wait = max(60, int(RISK_CONTROL.get('token_retry_min_wait_seconds', 180) or 180))
+        backoff = self._get_active_password_login_failure_backoff(current_time)
+        if backoff:
+            remaining = max(0, int(backoff.get('remaining_time', 0) or 0))
+            return max(min_wait, remaining + 60)
+        return max(min_wait, int(self.token_retry_interval or min_wait))
+
+    async def _protect_account_for_consecutive_failures(self, backoff_state: Optional[Dict[str, Any]] = None) -> bool:
+        state = backoff_state or self._get_active_password_login_failure_backoff()
+        if not state:
+            return False
+
+        reason = str(state.get('reason') or '').strip()
+        if not self._is_counted_password_login_failure_reason(reason):
+            return False
+
+        threshold = max(1, int(RISK_CONTROL.get('consecutive_failure_protection_threshold', 5) or 5))
+        consecutive_count = int(state.get('consecutive_count', 0) or 0)
+        if consecutive_count < threshold:
+            return False
+
+        pause_reason = f"连续{consecutive_count}次{reason}"
+        await self._apply_account_pause_state(
+            refresh_status="consecutive_failure_protected",
+            status_note="连续风控保护中",
+            error_message=f"检测到{pause_reason}，已暂停账号等待人工介入",
+            connection_message="连续风控失败，已自动暂停账号",
+            note_error_prefix="写入连续失败保护状态文案失败",
+            status_error_prefix="持久化连续失败保护状态失败",
+            memory_error_prefix="更新连续失败内存状态失败",
+        )
+        await self.send_account_paused_notification(
+            status_note="连续风控保护中",
+            pause_reason=pause_reason,
+            error_message=f"账号在自动恢复过程中已连续触发 {consecutive_count} 次 {reason}，系统已暂停自动恢复以避免继续放大风控。",
+            verification_url='',
+        )
+        await self._request_stop_after_account_pause("连续风控失败触发账号保护")
+        return True
 
     def _get_active_password_login_failure_backoff(self, current_time: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """获取仍在生效的密码登录失败退避状态，并处理可忽略的旧滑块退避。"""
@@ -1891,7 +2009,10 @@ class XianyuLive:
         self.last_slider_success_at = 0.0
         self.last_slider_success_cookie_length = 0
         self.slider_success_reentry_window = 30
-        self.post_slider_token_retry_delay = (1.5, 3.0)
+        self.post_slider_token_retry_delay = (
+            float(RISK_CONTROL.get('post_slider_retry_delay_min', 5.0) or 5.0),
+            float(RISK_CONTROL.get('post_slider_retry_delay_max', 10.0) or 10.0),
+        )
         self.last_password_login_backoff_log_time = 0.0
         self.token_refresh_lock = asyncio.Lock()  # 防止多个入口并发刷新 token
 
@@ -5768,14 +5889,17 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】Token刷新已有执行中任务，等待当前流程完成后复用结果")
 
         async with self.token_refresh_lock:
+            dedup_window = max(5, int(RISK_CONTROL.get('token_refresh_dedup_window_seconds', 60) or 60))
             if (
                 captcha_retry_count == 0 and
                 self.current_token and
                 self.last_token_refresh_status == "success" and
-                (time.time() - self.last_token_refresh_time) < 15
+                (time.time() - self.last_token_refresh_time) < dedup_window
             ):
-                logger.info(f"【{self.cookie_id}】最近15秒内已有成功的Token刷新结果，直接复用当前Token")
+                logger.info(f"【{self.cookie_id}】最近{dedup_window}秒内已有成功的Token刷新结果，直接复用当前Token")
                 return self.current_token
+            if captcha_retry_count == 0 and self._should_skip_token_refresh_for_login_backoff():
+                return None
             return await self._refresh_token_impl(
                 captcha_retry_count,
                 allow_password_login_recovery=allow_password_login_recovery,
@@ -6343,10 +6467,13 @@ class XianyuLive:
                                 return None
 
                             recent_slider_success = self._has_recent_slider_success()
-                            max_post_slider_session_retries = 2
+                            max_post_slider_session_retries = max(
+                                0,
+                                int(RISK_CONTROL.get('max_post_slider_session_retries', 1) or 1),
+                            )
 
                             if recent_slider_success and not post_slider_session_grace_used:
-                                grace_delay = random.uniform(1.2, 2.2)
+                                grace_delay = random.uniform(*self.post_slider_token_retry_delay)
                                 logger.warning(
                                     f"【{self.cookie_id}】检测到最近 {self.slider_success_reentry_window}s 内刚通过滑块，"
                                     f"先等待 {grace_delay:.2f}s 并重载Cookie后再试一次Token刷新"
@@ -6373,7 +6500,7 @@ class XianyuLive:
                                 post_slider_session_retry_count < max_post_slider_session_retries
                             ):
                                 settle_retry_attempt = post_slider_session_retry_count + 1
-                                settle_delay = random.uniform(2.4, 3.6) + ((settle_retry_attempt - 1) * 0.8)
+                                settle_delay = random.uniform(*self.post_slider_token_retry_delay) + ((settle_retry_attempt - 1) * 1.2)
                                 logger.warning(
                                     f"【{self.cookie_id}】预检模式下滑块成功后仍返回{expire_type}，"
                                     f"执行第{settle_retry_attempt}/{max_post_slider_session_retries}次稳定重试，"
@@ -7313,8 +7440,13 @@ class XianyuLive:
                     return False
                 backoff_reason, backoff_seconds = XianyuLive.classify_password_login_failure(login_error)
                 XianyuLive.set_password_login_failure_backoff(self.cookie_id, backoff_reason, backoff_seconds)
+                protected = await self._protect_account_for_consecutive_failures(
+                    XianyuLive.get_password_login_failure_backoff(self.cookie_id)
+                )
                 logger.warning(f"【{self.cookie_id}】密码登录失败，未获取到Cookie: {login_error}")
                 logger.warning(f"【{self.cookie_id}】已进入失败退避期: {backoff_reason}, {backoff_seconds}秒")
+                if protected:
+                    return False
                 if refresh_risk_log_id:
                     self._update_risk_log(
                         refresh_risk_log_id,
@@ -7352,9 +7484,14 @@ class XianyuLive:
             self.last_token_refresh_error_message = self._safe_str(refresh_e)
             backoff_reason, backoff_seconds = XianyuLive.classify_password_login_failure(str(refresh_e))
             XianyuLive.set_password_login_failure_backoff(self.cookie_id, backoff_reason, backoff_seconds)
+            protected = await self._protect_account_for_consecutive_failures(
+                XianyuLive.get_password_login_failure_backoff(self.cookie_id)
+            )
             logger.error(f"【{self.cookie_id}】Cookie刷新或实例重启失败: {self._safe_str(refresh_e)}")
             import traceback
             logger.error(f"【{self.cookie_id}】详细堆栈:\n{traceback.format_exc()}")
+            if protected:
+                return False
             if refresh_risk_log_id:
                 self._update_risk_log(
                     refresh_risk_log_id,
@@ -11410,7 +11547,8 @@ class XianyuLive:
                         break
 
                     current_time = time.time()
-                    if current_time - self.last_session_keepalive_time >= self.session_keepalive_interval:
+                    effective_keepalive_interval = self._get_effective_keepalive_interval()
+                    if current_time - self.last_session_keepalive_time >= effective_keepalive_interval:
                         logger.info(f"【{self.cookie_id}】开始执行轻量会话保活...")
                         keepalive_ok = await self.keep_session_alive()
                         if keepalive_ok:
@@ -11437,9 +11575,9 @@ class XianyuLive:
                                 )
                             logger.warning(
                                 f"【{self.cookie_id}】重型Token恢复失败(status={last_refresh_status})，"
-                                f"{self.token_retry_interval} 秒后重试"
+                                f"{self._compute_token_retry_wait_seconds(current_time)} 秒后重试"
                             )
-                            await self._interruptible_sleep(self.token_retry_interval)
+                            await self._interruptible_sleep(self._compute_token_retry_wait_seconds(current_time))
                         else:
                             logger.warning(
                                 f"【{self.cookie_id}】轻量保活失败(status={keepalive_status})，"
@@ -12049,7 +12187,13 @@ class XianyuLive:
                         continue
 
                     current_time = time.time()
-                    if current_time - self.last_cookie_refresh_time >= self.cookie_refresh_interval:
+                    if self._should_skip_token_refresh_for_login_backoff(current_time):
+                        logger.info(f"【{self.cookie_id}】当前处于密码登录退避期，跳过自动Cookie刷新")
+                        await self._interruptible_sleep(60)
+                        continue
+
+                    effective_cookie_refresh_interval = self._get_effective_cookie_refresh_interval()
+                    if current_time - self.last_cookie_refresh_time >= effective_cookie_refresh_interval:
                         # 检查是否在消息接收后的冷却时间内
                         time_since_last_message = current_time - self.last_message_received_time
                         if time_since_last_message < self.message_cookie_refresh_cooldown:

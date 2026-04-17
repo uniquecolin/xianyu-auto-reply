@@ -703,6 +703,47 @@
               </div>
             </div>
 
+            <div id="risk-control-settings" class="card mt-4" style="display: none;">
+              <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                <div>
+                  <span class="fw-semibold"><i class="bi bi-moon-stars me-2"></i>风控降频设置</span>
+                  <div class="text-muted small mt-1">管理员可为夜间低活跃时段单独降低保活与 Cookie 刷新频率。</div>
+                </div>
+                <span class="badge bg-warning">管理员专用</span>
+              </div>
+              <div class="card-body">
+                <div class="row g-3 align-items-end">
+                  <div class="col-md-4">
+                    <div class="form-check form-switch mt-2">
+                      <input class="form-check-input" type="checkbox" id="riskControlNightModeEnabled">
+                      <label class="form-check-label" for="riskControlNightModeEnabled">
+                        <strong>启用夜间风控降频</strong>
+                      </label>
+                    </div>
+                    <div class="form-text">
+                      仅降低 token/session 保活与 Cookie 刷新频率，不影响 WebSocket 心跳和消息接收。
+                    </div>
+                  </div>
+                  <div class="col-md-3">
+                    <label for="riskControlNightStartHour" class="form-label">开始小时</label>
+                    <input type="number" class="form-control" id="riskControlNightStartHour" min="0" max="23" step="1" value="1">
+                    <div class="form-text">取值范围 0-23</div>
+                  </div>
+                  <div class="col-md-3">
+                    <label for="riskControlNightEndHour" class="form-label">结束小时</label>
+                    <input type="number" class="form-control" id="riskControlNightEndHour" min="0" max="23" step="1" value="6">
+                    <div class="form-text">支持跨天，例如 23 到 5</div>
+                  </div>
+                  <div class="col-md-2 d-grid">
+                    <button type="button" class="btn btn-primary" onclick="saveRiskControlNightSettings()">
+                      <i class="bi bi-check-circle me-1"></i>保存设置
+                    </button>
+                  </div>
+                </div>
+                <div id="riskControlNightSettingsStatus" class="alert alert-info mt-3 mb-0 d-none"></div>
+              </div>
+            </div>
+
             <div class="about-history-panel account-diagnostics-history-panel mt-4">
               <div class="account-diagnostics-section-head">
                 <div>
@@ -737,6 +778,7 @@
                 </div>
               </div>
             </div>
+
           </div>
         </div>
       </div>

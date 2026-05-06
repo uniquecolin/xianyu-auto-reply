@@ -2086,9 +2086,11 @@ class XianyuLive:
         
         # 消息去重机制：防止同一条消息被处理多次
         self.processed_message_ids = {}  # 存储已处理的消息ID和时间戳 {message_id: timestamp}
+        self.pending_message_ids = {}  # 存储正在处理中的消息ID和时间戳 {message_id: timestamp}
         self.processed_message_ids_lock = asyncio.Lock()  # 消息ID去重的锁
         self.processed_message_ids_max_size = 10000  # 最大保存10000个消息ID，防止内存泄漏
         self.message_expire_time = 3600  # 消息过期时间（秒），默认1小时后可以重复回复
+        self.pending_message_expire_time = 300  # 消息处理中保留时间（秒），避免处理中途异常导致永久卡死
 
         # 订单详情补抓任务：详情首次超时时，后台再补抓一次，避免整单丢失
         self.order_detail_retry_tasks = {}
@@ -14118,10 +14120,79 @@ class XianyuLive:
                                     pass
         except Exception as e:
             logger.debug(f"【{self.cookie_id}】提取消息ID失败: {self._safe_str(e)}")
-        
+
         return None
 
-    async def _schedule_debounced_reply(self, chat_id: str, message_data: dict, websocket, 
+    def _cleanup_message_reply_state(self, current_time: float):
+        """清理过期的已处理/处理中消息状态。"""
+        expired_processed_ids = [
+            msg_id for msg_id, timestamp in self.processed_message_ids.items()
+            if current_time - timestamp > self.message_expire_time
+        ]
+        for msg_id in expired_processed_ids:
+            del self.processed_message_ids[msg_id]
+
+        expired_pending_ids = [
+            msg_id for msg_id, timestamp in self.pending_message_ids.items()
+            if current_time - timestamp > self.pending_message_expire_time
+        ]
+        for msg_id in expired_pending_ids:
+            del self.pending_message_ids[msg_id]
+
+        if expired_processed_ids:
+            logger.info(f"【{self.cookie_id}】已清理 {len(expired_processed_ids)} 个过期消息ID")
+        if expired_pending_ids:
+            logger.warning(f"【{self.cookie_id}】已清理 {len(expired_pending_ids)} 个超时未完成的消息预占")
+
+        if len(self.processed_message_ids) > self.processed_message_ids_max_size:
+            sorted_ids = sorted(self.processed_message_ids.items(), key=lambda x: x[1])
+            remove_count = len(sorted_ids) // 2
+            for msg_id, _ in sorted_ids[:remove_count]:
+                del self.processed_message_ids[msg_id]
+            logger.info(f"【{self.cookie_id}】消息ID去重字典过大，已清理 {remove_count} 个最旧记录")
+
+    async def _reserve_message_reply(self, message_id: str) -> bool:
+        """为消息创建处理预占，防止并发重复回复。"""
+        async with self.processed_message_ids_lock:
+            current_time = time.time()
+            self._cleanup_message_reply_state(current_time)
+
+            if message_id in self.processed_message_ids:
+                last_process_time = self.processed_message_ids[message_id]
+                time_elapsed = current_time - last_process_time
+                remaining_time = int(max(0, self.message_expire_time - time_elapsed))
+                logger.warning(f"【{self.cookie_id}】消息ID {message_id[:50]}... 已处理过，距离可重复回复还需 {remaining_time} 秒")
+                return False
+
+            if message_id in self.pending_message_ids:
+                time_elapsed = current_time - self.pending_message_ids[message_id]
+                remaining_time = int(max(0, self.pending_message_expire_time - time_elapsed))
+                logger.warning(f"【{self.cookie_id}】消息ID {message_id[:50]}... 正在处理中，预占剩余约 {remaining_time} 秒")
+                return False
+
+            self.pending_message_ids[message_id] = current_time
+            return True
+
+    async def _finalize_message_reply(self, message_id: str, reason: str = ""):
+        """将消息从处理中转为已完成，后续重复包不再回复。"""
+        async with self.processed_message_ids_lock:
+            current_time = time.time()
+            self.pending_message_ids.pop(message_id, None)
+            self.processed_message_ids[message_id] = current_time
+            self._cleanup_message_reply_state(current_time)
+
+        if reason:
+            logger.info(f"【{self.cookie_id}】消息ID {message_id[:50]}... 已完成处理: {reason}")
+
+    async def _release_message_reply(self, message_id: str, reason: str = ""):
+        """释放消息处理预占，允许后续重试。"""
+        async with self.processed_message_ids_lock:
+            released = self.pending_message_ids.pop(message_id, None)
+
+        if released is not None:
+            logger.warning(f"【{self.cookie_id}】消息ID {message_id[:50]}... 已释放预占，允许重试: {reason or 'unknown'}")
+
+    async def _schedule_debounced_reply(self, chat_id: str, message_data: dict, websocket,
                                        send_user_name: str, send_user_id: str, send_message: str,
                                        item_id: str, msg_time: str):
         """
@@ -14155,48 +14226,12 @@ class XianyuLive:
             except Exception:
                 # 如果提取失败，使用当前时间戳
                 message_id = f"{chat_id}_{send_message}_{int(time.time() * 1000)}"
-        
-        async with self.processed_message_ids_lock:
-            current_time = time.time()
-            
-            # 检查消息是否已处理且未过期
-            if message_id in self.processed_message_ids:
-                last_process_time = self.processed_message_ids[message_id]
-                time_elapsed = current_time - last_process_time
-                
-                # 如果消息处理时间未超过1小时，跳过
-                if time_elapsed < self.message_expire_time:
-                    remaining_time = int(self.message_expire_time - time_elapsed)
-                    logger.warning(f"【{self.cookie_id}】消息ID {message_id[:50]}... 已处理过，距离可重复回复还需 {remaining_time} 秒")
-                    return
-                else:
-                    # 超过1小时，可以重新处理
-                    logger.info(f"【{self.cookie_id}】消息ID {message_id[:50]}... 已超过 {int(time_elapsed/60)} 分钟，允许重新回复")
-            
-            # 标记消息ID为已处理（更新或添加时间戳）
-            self.processed_message_ids[message_id] = current_time
-            
-            # 定期清理过期的消息ID
-            if len(self.processed_message_ids) > self.processed_message_ids_max_size:
-                # 清理超过1小时的旧记录
-                expired_ids = [
-                    msg_id for msg_id, timestamp in self.processed_message_ids.items()
-                    if current_time - timestamp > self.message_expire_time
-                ]
-                
-                for msg_id in expired_ids:
-                    del self.processed_message_ids[msg_id]
-                
-                logger.info(f"【{self.cookie_id}】已清理 {len(expired_ids)} 个过期消息ID")
-                
-                # 如果清理后仍然过大，删除最旧的一半
-                if len(self.processed_message_ids) > self.processed_message_ids_max_size:
-                    sorted_ids = sorted(self.processed_message_ids.items(), key=lambda x: x[1])
-                    remove_count = len(sorted_ids) // 2
-                    for msg_id, _ in sorted_ids[:remove_count]:
-                        del self.processed_message_ids[msg_id]
-                    logger.info(f"【{self.cookie_id}】消息ID去重字典过大，已清理 {remove_count} 个最旧记录")
-        
+
+        # in-flight 锁：原子地检查"已处理 / 正在处理"两个状态，预占后才进入防抖
+        # （替代原来的 inline check-and-set，修复同消息并发时被多次回复的问题）
+        if not await self._reserve_message_reply(message_id):
+            return
+
         async with self.message_debounce_lock:
             # 如果该chat_id已有防抖任务，取消它
             if chat_id in self.message_debounce_tasks:
@@ -14204,11 +14239,12 @@ class XianyuLive:
                 if old_task and not old_task.done():
                     old_task.cancel()
                     logger.warning(f"【{self.cookie_id}】取消chat_id {chat_id} 的旧防抖任务")
-            
+
             # 更新最后一条消息信息
             current_timer = time.time()
             self.message_debounce_tasks[chat_id] = {
                 'last_message': {
+                    'message_id': message_id,
                     'message_data': message_data,
                     'websocket': websocket,
                     'send_user_name': send_user_name,
@@ -14256,11 +14292,21 @@ class XianyuLive:
                         chat_id,
                         last_msg['msg_time']
                     )
-                    
+                    # 无异常即视为已收口，把 in-flight 预占转成已处理（防止短时间重复入队）
+                    await self._finalize_message_reply(last_msg['message_id'], reason="回复链处理完成")
+
                 except asyncio.CancelledError:
                     logger.warning(f"【{self.cookie_id}】chat_id {chat_id} 的防抖任务被取消")
+                    try:
+                        await self._release_message_reply(message_id, reason="防抖任务取消")
+                    except Exception:
+                        pass
                 except Exception as e:
                     logger.error(f"【{self.cookie_id}】处理防抖回复时发生错误: {self._safe_str(e)}")
+                    try:
+                        await self._release_message_reply(message_id, reason=f"防抖任务异常: {self._safe_str(e)}")
+                    except Exception:
+                        pass
                     # 确保从防抖任务中移除
                     async with self.message_debounce_lock:
                         if chat_id in self.message_debounce_tasks:

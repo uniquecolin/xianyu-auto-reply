@@ -983,6 +983,7 @@ class XianyuSliderStealth:
         self.playwright_browser_name = os.environ.get("XY_SLIDER_PLAYWRIGHT_BROWSER", "chromium").strip() or "chromium"
         existing_playwright_cache_dir = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
         is_docker_env = os.environ.get("DOCKER_ENV", "").strip().lower() in {"1", "true", "yes", "on"}
+        self.is_docker_env = is_docker_env
         if existing_playwright_cache_dir and existing_playwright_cache_dir != "0":
             self.playwright_browser_cache_dir = existing_playwright_cache_dir
         elif is_docker_env and os.path.isdir("/ms-playwright"):
@@ -1913,6 +1914,23 @@ class XianyuSliderStealth:
             and str(self.profile_id or "").startswith("win_chrome_147_1600x900")
         )
 
+    def _should_prefer_docker_conservative_profile(self, has_learning: bool) -> bool:
+        if has_learning:
+            return False
+        if not (self.headless and self.is_docker_env and self.automation_backend == "playwright"):
+            return False
+        if not self._use_headless_stable_profile():
+            return False
+        local_browser_info = getattr(self, "local_browser_info", None) or {}
+        return bool(
+            str(local_browser_info.get("source") or "") == "project_playwright_cache"
+            or bool(local_browser_info.get("version"))
+            or bool(self.executable_path)
+        )
+
+    def _should_force_docker_cold_start_conservative(self, attempt: int, has_learning: bool) -> bool:
+        return attempt == 1 and self._should_prefer_docker_conservative_profile(has_learning)
+
     def _get_light_stealth_script(self, browser_features: Dict[str, Any]) -> str:
         locale = json.dumps(browser_features.get("locale") or "zh-CN", ensure_ascii=False)
         platform = json.dumps(browser_features.get("platform") or "Win32", ensure_ascii=False)
@@ -2038,6 +2056,61 @@ class XianyuSliderStealth:
             feedback["dom_error_text"] = error_text
 
         self.last_verification_feedback = feedback
+
+    def _harden_password_slider_runtime(self, search_target=None) -> None:
+        if getattr(self, "_password_slider_runtime_hardened", False):
+            return
+
+        targets = []
+        if search_target is not None:
+            targets.append(("slider", search_target))
+        if self.page is not None and self.page is not search_target:
+            targets.append(("page", self.page))
+
+        if not targets:
+            self._password_slider_runtime_hardened = True
+            return
+
+        harden_script = """
+            () => {
+                const defineGetter = (target, prop, getter) => {
+                    try {
+                        Object.defineProperty(target, prop, {
+                            get: getter,
+                            configurable: true
+                        });
+                    } catch (e) {}
+                };
+
+                try {
+                    defineGetter(Navigator.prototype, 'webdriver', () => undefined);
+                } catch (e) {}
+                try {
+                    defineGetter(Navigator.prototype, 'languages', () => ['zh-CN', 'zh', 'en']);
+                } catch (e) {}
+                try {
+                    defineGetter(Navigator.prototype, 'plugins', () => [1, 2, 3, 4, 5]);
+                } catch (e) {}
+                try {
+                    window.chrome = window.chrome || {};
+                    window.chrome.runtime = window.chrome.runtime || {};
+                } catch (e) {}
+                return true;
+            }
+        """
+
+        applied = False
+        for target_name, target in targets:
+            try:
+                target.evaluate(harden_script)
+                applied = True
+                logger.info(f"【{self.pure_user_id}】已加固密码登录滑块运行时: {target_name}")
+            except Exception as e:
+                logger.debug(f"【{self.pure_user_id}】加固密码登录滑块运行时失败({target_name}): {e}")
+
+        self._password_slider_runtime_hardened = True
+        if not applied:
+            logger.debug(f"【{self.pure_user_id}】密码登录滑块运行时加固未命中可执行目标")
 
     def _apply_runtime_browser_profile(self, browser_features: Dict[str, Any]) -> Dict[str, Any]:
         features = dict(browser_features)

@@ -813,3 +813,4 @@ utils/ws_utils.py
 secure_confirm_ultra.py
 secure_freeshipping_ultra.py
 test_php_stats.py
+.playwright-browsers/

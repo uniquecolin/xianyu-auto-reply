@@ -222,6 +222,15 @@ class SecureConfirm:
                         error_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
                         logger.warning(f"【{self.cookie_id}】❌ 自动确认发货失败: {error_msg}")
 
+                        if 'FAIL_SYS_SESSION_EXPIRED' in error_msg or 'Session过期' in error_msg:
+                            return {
+                                "error": error_msg,
+                                "order_id": order_id,
+                                "session_expired": True,
+                                "need_relogin": True,
+                                "confirm_retry_required": True,
+                            }
+
                         return await self.auto_confirm(order_id, item_id, retry_count + 1)
 
 

@@ -30,6 +30,7 @@ from config import RISK_CONTROL
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
 from blacklist_service import blacklist_service
+from message_filter_service import message_filter_service
 from utils.qr_login import qr_login_manager
 from utils.qr_login_lite import qrcode_login_lite
 from utils.xianyu_utils import trans_cookies
@@ -124,6 +125,8 @@ ORDER_STATUS_ALIASES = {
     '待付款': 'pending_payment',
     '待发货': 'pending_ship',
     '部分发货': 'partial_success',
+    '待补确认': 'partial_pending_finalize',
+    '卡券已发出、平台确认失败、等待补确认': 'partial_pending_finalize',
     '部分待收尾': 'partial_pending_finalize',
     '已发货': 'shipped',
     '已完成': 'completed',
@@ -1096,6 +1099,24 @@ class ResponseData(BaseModel):
 class ResponseModel(BaseModel):
     code: int
     data: ResponseData
+
+
+class MessageFilterRuleRequest(BaseModel):
+    name: str
+    patterns: Any
+    cookie_id: Optional[str] = None
+    item_id: Optional[str] = None
+    match_type: str = 'contains'
+    message_source: str = 'user'
+    is_enabled: bool = True
+    action_skip_auto_reply: bool = True
+    action_skip_ai_reply: bool = False
+    action_pause_minutes: int = 0
+    action_notify: bool = False
+
+
+class MessageFilterToggleRequest(BaseModel):
+    is_enabled: bool
 
 
 class PersonalBlacklistCreateRequest(BaseModel):
@@ -2503,6 +2524,115 @@ async def xianyu_reply(req: RequestModel):
             db_manager.add_default_reply_record(req.cookie_id, req.chat_id)
 
     return {"code": 200, "data": {"send_msg": send_msg}}
+
+
+# ------------------------- 消息过滤规则接口 -------------------------
+
+
+def _normalize_message_filter_payload(request: MessageFilterRuleRequest, current_user: Dict[str, Any]) -> Dict[str, Any]:
+    payload = request.dict()
+    cookie_id = str(payload.get('cookie_id') or '').strip()
+    if cookie_id:
+        payload['cookie_id'] = _ensure_cookie_access(cookie_id, current_user)
+    else:
+        payload['cookie_id'] = None
+    payload['item_id'] = str(payload.get('item_id') or '').strip() or None
+    return payload
+
+
+@app.get('/api/message-filters')
+def get_message_filters(
+    keyword: str = None,
+    page: int = 1,
+    page_size: int = 20,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        result = message_filter_service.list_rules(
+            user_id=current_user['user_id'],
+            keyword=keyword,
+            page=page,
+            page_size=page_size,
+        )
+        return {'success': True, **result}
+    except Exception as e:
+        log_with_user('error', f"查询消息过滤规则失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='查询消息过滤规则失败')
+
+
+@app.post('/api/message-filters')
+def create_message_filter(
+    request: MessageFilterRuleRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        payload = _normalize_message_filter_payload(request, current_user)
+        record = message_filter_service.create_rule(current_user['user_id'], payload)
+        log_with_user('info', f"新增消息过滤规则: {record.get('name') or ''}", current_user)
+        return {'success': True, 'message': '消息过滤规则已保存', 'data': record}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log_with_user('error', f"新增消息过滤规则失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='新增消息过滤规则失败')
+
+
+@app.put('/api/message-filters/{rule_id}')
+def update_message_filter(
+    rule_id: int,
+    request: MessageFilterRuleRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        payload = _normalize_message_filter_payload(request, current_user)
+        record = message_filter_service.update_rule(rule_id, current_user['user_id'], payload)
+        if not record:
+            raise HTTPException(status_code=404, detail='消息过滤规则不存在')
+        return {'success': True, 'message': '消息过滤规则已更新', 'data': record}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log_with_user('error', f"更新消息过滤规则失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='更新消息过滤规则失败')
+
+
+@app.patch('/api/message-filters/{rule_id}/toggle')
+def toggle_message_filter(
+    rule_id: int,
+    request: MessageFilterToggleRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        success = message_filter_service.toggle_rule(rule_id, current_user['user_id'], request.is_enabled)
+        if not success:
+            raise HTTPException(status_code=404, detail='消息过滤规则不存在')
+        return {'success': True, 'message': '状态已更新'}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"更新消息过滤规则状态失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='更新消息过滤规则状态失败')
+
+
+@app.delete('/api/message-filters/{rule_id}')
+def delete_message_filter(
+    rule_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        success = message_filter_service.delete_rule(rule_id, current_user['user_id'])
+        if not success:
+            raise HTTPException(status_code=404, detail='消息过滤规则不存在')
+        return {'success': True, 'message': '删除成功'}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"删除消息过滤规则失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='删除消息过滤规则失败')
 
 
 # ------------------------- 黑名单接口 -------------------------
@@ -14060,16 +14190,28 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                 item_id=item_id
             )
             if not finalize_result.get('success'):
-                xianyu_instance._persist_delivery_finalization_state(
-                    order_id=order_id,
-                    item_id=item_id,
-                    buyer_id=buyer_id,
-                    delivery_meta=pending_finalize_meta,
-                    channel='manual',
-                    status='sent',
-                    last_error=finalize_result.get('error') or f'检测到第 {unit_index} 个发货单元已发送记录，但补完成收尾失败'
-                )
-                return {"success": False, "delivered": False, "message": finalize_result.get('error') or f'检测到第 {unit_index} 个发货单元已发送记录，但补完成收尾失败'}
+                finalize_error = finalize_result.get('error') or f'检测到第 {unit_index} 个发货单元已发送记录，但补完成收尾失败'
+                if hasattr(xianyu_instance, '_is_platform_confirm_failure_error') and xianyu_instance._is_platform_confirm_failure_error(finalize_error):
+                    xianyu_instance._mark_delivery_pending_platform_confirm(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        delivery_meta=pending_finalize_meta,
+                        confirm_error=finalize_error,
+                        expected_quantity=expected_quantity,
+                        context="手动发货补完成收尾时平台确认失败"
+                    )
+                else:
+                    xianyu_instance._persist_delivery_finalization_state(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        delivery_meta=pending_finalize_meta,
+                        channel='manual',
+                        status='sent',
+                        last_error=finalize_error
+                    )
+                return {"success": False, "delivered": False, "message": finalize_error}
 
             xianyu_instance._persist_delivery_finalization_state(
                 order_id=order_id,
@@ -14442,7 +14584,7 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
         if finalized_now:
             message_parts.append(f"本次补发成功 {len(finalized_now)} 个单元")
         if pending_finalize_now:
-            message_parts.append(f"仍有 {len(pending_finalize_now)} 个单元待收尾")
+            message_parts.append(f"仍有 {len(pending_finalize_now)} 个单元待补确认")
         if failed_now:
             message_parts.append(f"仍有 {len(failed_now)} 个单元补发失败")
 
@@ -14451,7 +14593,7 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
             message_parts.append(f"订单已全部完成（{progress_summary_after.get('finalized_count', 0)}/{expected_quantity}）")
         elif aggregate_status == 'partial_pending_finalize':
             message_parts.append(
-                f"订单当前为部分待收尾（已完成 {progress_summary_after.get('finalized_count', 0)}/{expected_quantity}，待收尾 {progress_summary_after.get('pending_finalize_count', 0)}）"
+                f"订单当前为待补确认（已完成 {progress_summary_after.get('finalized_count', 0)}/{expected_quantity}，待补确认 {progress_summary_after.get('pending_finalize_count', 0)}）"
             )
         elif aggregate_status == 'partial_success':
             message_parts.append(

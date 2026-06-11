@@ -68,6 +68,13 @@ let blacklistState = {
     total: 0,
     accountsLoaded: false
 };
+let messageFilterState = {
+    page: 1,
+    pageSize: 20,
+    total: 0,
+    accountsLoaded: false,
+    editingId: null
+};
 let loadingRequestCount = 0;
 let loadingShowTimer = null;
 const LOADING_SHOW_DELAY = 120;
@@ -132,6 +139,9 @@ function showSection(sectionName) {
         break;
     case 'auto-reply':      // 【自动回复菜单】
         refreshAccountList();
+        break;
+    case 'message-filters': // 【消息过滤菜单】
+        loadMessageFiltersPage();
         break;
     case 'cards':           // 【卡券管理菜单】
         loadCards();
@@ -3382,6 +3392,374 @@ async function fetchJSON(url, opts = {}) {
     handleApiError(err);
     throw err;
     }
+}
+
+// ================================
+// 【消息过滤菜单】相关功能
+// ================================
+
+async function loadMessageFiltersPage() {
+    await loadMessageFilterAccountOptions();
+    await loadMessageFilters(messageFilterState.page || 1);
+}
+
+async function loadMessageFilterAccountOptions(force = false) {
+    const accountSelect = document.getElementById('messageFilterCookieId');
+    if (!accountSelect) return;
+    if (messageFilterState.accountsLoaded && !force) return;
+
+    try {
+        const currentValue = accountSelect.value;
+        const accounts = await fetchJSON(`${apiBase}/cookies/details`);
+        const safeAccounts = Array.isArray(accounts) ? accounts : [];
+        accountSelect.innerHTML = '<option value="">全部账号</option>' + safeAccounts.map(account => {
+            const accountId = String(account.id || '').trim();
+            const remark = String(account.remark || '').trim();
+            const label = remark ? `${accountId}（${remark}）` : accountId;
+            return `<option value="${escapeHtml(accountId)}">${escapeHtml(label)}</option>`;
+        }).join('');
+        if (currentValue && safeAccounts.some(account => String(account.id || '') === currentValue)) {
+            accountSelect.value = currentValue;
+        }
+        messageFilterState.accountsLoaded = true;
+    } catch (error) {
+        console.error('加载消息过滤账号选项失败:', error);
+    }
+}
+
+function handleMessageFilterKeydown(event) {
+    if (event.key === 'Enter') {
+        event.preventDefault();
+        loadMessageFilters(1);
+    }
+}
+
+async function loadMessageFilters(page = 1) {
+    const tableBody = document.getElementById('messageFilterTableBody');
+    if (!tableBody) return;
+
+    const pageSizeSelect = document.getElementById('messageFilterPageSize');
+    const pageSize = Math.max(1, parseInt(pageSizeSelect?.value || '20', 10) || 20);
+    const safePage = Math.max(1, parseInt(page, 10) || 1);
+    const params = new URLSearchParams({
+        page: String(safePage),
+        page_size: String(pageSize)
+    });
+    const keyword = document.getElementById('messageFilterKeyword')?.value?.trim();
+    if (keyword) params.set('keyword', keyword);
+
+    try {
+        const result = await fetchJSON(`${apiBase}/api/message-filters?${params.toString()}`);
+        const records = Array.isArray(result?.data) ? result.data : [];
+        messageFilterState.page = Number(result?.page || safePage);
+        messageFilterState.pageSize = Number(result?.page_size || pageSize);
+        messageFilterState.total = Number(result?.total || 0);
+        renderMessageFilters(records);
+        renderMessageFilterPagination();
+    } catch (error) {
+        console.error('加载消息过滤规则失败:', error);
+        tableBody.innerHTML = `
+            <tr>
+                <td colspan="7" class="text-center py-4 text-danger">
+                    <i class="bi bi-exclamation-triangle fs-1 d-block mb-3"></i>
+                    加载消息过滤规则失败
+                </td>
+            </tr>
+        `;
+    }
+}
+
+function getMessageFilterScopeBadge(scope) {
+    const normalizedScope = String(scope || 'user');
+    const config = {
+        item: { text: '商品级', cls: 'bg-warning text-dark' },
+        account: { text: '账号级', cls: 'bg-info text-dark' },
+        user: { text: '用户级', cls: 'bg-secondary' }
+    }[normalizedScope] || { text: normalizedScope || '未知', cls: 'bg-secondary' };
+    return `<span class="badge ${config.cls}">${escapeHtml(config.text)}</span>`;
+}
+
+function getMessageFilterMatchTypeLabel(matchType) {
+    return ({
+        contains: '包含',
+        exact: '完全',
+        regex: '正则'
+    }[String(matchType || 'contains')] || '包含');
+}
+
+function getMessageFilterSourceLabel(source) {
+    return ({
+        user: '客户',
+        system: '系统',
+        all: '全部'
+    }[String(source || 'user')] || '客户');
+}
+
+function getMessageFilterActionsHtml(record) {
+    const actions = [];
+    if (record?.action_skip_auto_reply) actions.push('跳过自动回复');
+    if (record?.action_skip_ai_reply) actions.push('跳过AI');
+    const pauseMinutes = Number(record?.action_pause_minutes || 0);
+    if (pauseMinutes > 0) actions.push(`暂停${pauseMinutes}分钟`);
+    if (record?.action_notify) actions.push('通知人工');
+    if (actions.length === 0) return '<span class="text-muted small">仅记录</span>';
+    return actions.map(action => `<span class="badge bg-light text-dark border me-1 mb-1">${escapeHtml(action)}</span>`).join('');
+}
+
+function renderMessageFilters(records) {
+    const tableBody = document.getElementById('messageFilterTableBody');
+    const totalText = document.getElementById('messageFilterTotalText');
+    if (!tableBody) return;
+
+    if (totalText) {
+        totalText.textContent = `共 ${messageFilterState.total || 0} 条`;
+    }
+
+    if (!Array.isArray(records) || records.length === 0) {
+        tableBody.innerHTML = `
+            <tr>
+                <td colspan="7" class="text-center py-4 text-muted">
+                    <i class="bi bi-funnel fs-1 d-block mb-3"></i>
+                    暂无过滤规则
+                </td>
+            </tr>
+        `;
+        return;
+    }
+
+    tableBody.innerHTML = records.map(record => {
+        const ruleId = Number(record.id || 0);
+        const name = String(record.name || '').trim();
+        const patterns = Array.isArray(record.patterns) ? record.patterns : [];
+        const patternPreview = patterns.slice(0, 3).join(' / ');
+        const cookieId = String(record.cookie_id || '').trim();
+        const itemId = String(record.item_id || '').trim();
+        const enabled = Boolean(record.is_enabled);
+        const updatedAt = formatDateTime(record.updated_at || record.created_at || '');
+        const targetParts = [];
+        targetParts.push(cookieId ? `账号 ${cookieId}` : '全部账号');
+        if (itemId) targetParts.push(`商品 ${itemId}`);
+        const encodedRecord = encodeURIComponent(JSON.stringify(record));
+        return `
+            <tr>
+                <td>
+                    ${getMessageFilterScopeBadge(record.scope)}
+                    <div class="small text-muted mt-1">${targetParts.map(part => escapeHtml(part)).join('<br>')}</div>
+                </td>
+                <td>
+                    <div class="fw-semibold" title="${escapeHtml(name)}">${escapeHtml(name || '-')}</div>
+                    <div class="small text-muted">${getMessageFilterSourceLabel(record.message_source)}消息</div>
+                </td>
+                <td style="max-width: 220px;">
+                    <div class="small"><span class="badge bg-light text-dark border">${getMessageFilterMatchTypeLabel(record.match_type)}</span></div>
+                    <div class="text-truncate mt-1" title="${escapeHtml(patterns.join('\n'))}">${escapeHtml(patternPreview || '-')}</div>
+                </td>
+                <td style="max-width: 260px;">${getMessageFilterActionsHtml(record)}</td>
+                <td>
+                    <div class="form-check form-switch m-0" title="${enabled ? '点击禁用' : '点击启用'}">
+                        <input class="form-check-input" type="checkbox" ${enabled ? 'checked' : ''} onchange="toggleMessageFilter(${ruleId}, this.checked)">
+                    </div>
+                </td>
+                <td><small class="text-muted text-nowrap">${escapeHtml(updatedAt)}</small></td>
+                <td>
+                    <div class="btn-group btn-group-sm" role="group">
+                        <button type="button" class="btn btn-outline-primary" onclick="editMessageFilterRule('${encodedRecord}')" title="编辑">
+                            <i class="bi bi-pencil"></i>
+                        </button>
+                        <button type="button" class="btn btn-outline-danger" onclick="deleteMessageFilter(${ruleId})" title="删除">
+                            <i class="bi bi-trash"></i>
+                        </button>
+                    </div>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function renderMessageFilterPagination() {
+    const pagination = document.getElementById('messageFilterPagination');
+    const pageText = document.getElementById('messageFilterPageText');
+    if (!pagination) return;
+
+    const pageSize = Math.max(1, Number(messageFilterState.pageSize || 20));
+    const total = Math.max(0, Number(messageFilterState.total || 0));
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const currentPage = Math.min(Math.max(1, Number(messageFilterState.page || 1)), totalPages);
+
+    if (currentPage !== messageFilterState.page && total > 0) {
+        loadMessageFilters(currentPage);
+        return;
+    }
+
+    if (pageText) {
+        pageText.textContent = `第 ${currentPage} / ${totalPages} 页`;
+    }
+
+    const startPage = Math.max(1, currentPage - 2);
+    const endPage = Math.min(totalPages, startPage + 4);
+    const buttons = [];
+    const addButton = (label, targetPage, disabled = false, active = false, title = '') => {
+        buttons.push(`
+            <button type="button" class="btn btn-sm ${active ? 'btn-primary' : 'btn-outline-secondary'}" ${disabled ? 'disabled' : ''} onclick="loadMessageFilters(${targetPage})" title="${escapeHtml(title || label)}">
+                ${label}
+            </button>
+        `);
+    };
+
+    addButton('<i class="bi bi-chevron-left"></i>', currentPage - 1, currentPage <= 1, false, '上一页');
+    for (let page = startPage; page <= endPage; page += 1) {
+        addButton(String(page), page, false, page === currentPage);
+    }
+    addButton('<i class="bi bi-chevron-right"></i>', currentPage + 1, currentPage >= totalPages, false, '下一页');
+    pagination.innerHTML = buttons.join('');
+}
+
+function getMessageFilterPayload() {
+    const name = document.getElementById('messageFilterName')?.value?.trim() || '';
+    const patterns = document.getElementById('messageFilterPatterns')?.value?.trim() || '';
+    if (!name) {
+        showToast('请填写规则名称', 'warning');
+        return null;
+    }
+    if (!patterns) {
+        showToast('请填写匹配内容', 'warning');
+        return null;
+    }
+    const pauseMinutes = Math.max(0, parseInt(document.getElementById('messageFilterPauseMinutes')?.value || '0', 10) || 0);
+    return {
+        name,
+        cookie_id: document.getElementById('messageFilterCookieId')?.value?.trim() || null,
+        item_id: document.getElementById('messageFilterItemId')?.value?.trim() || null,
+        match_type: document.getElementById('messageFilterMatchType')?.value || 'contains',
+        message_source: document.getElementById('messageFilterSource')?.value || 'user',
+        patterns,
+        is_enabled: Boolean(document.getElementById('messageFilterEnabled')?.checked),
+        action_skip_auto_reply: Boolean(document.getElementById('messageFilterSkipAutoReply')?.checked),
+        action_skip_ai_reply: Boolean(document.getElementById('messageFilterSkipAiReply')?.checked),
+        action_pause_minutes: Math.min(pauseMinutes, 1440),
+        action_notify: Boolean(document.getElementById('messageFilterNotify')?.checked)
+    };
+}
+
+async function saveMessageFilterRule() {
+    const payload = getMessageFilterPayload();
+    if (!payload) return;
+
+    const editingId = Number(messageFilterState.editingId || 0);
+    const url = editingId > 0
+        ? `${apiBase}/api/message-filters/${editingId}`
+        : `${apiBase}/api/message-filters`;
+    const method = editingId > 0 ? 'PUT' : 'POST';
+
+    try {
+        const result = await fetchJSON(url, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        showToast(result?.message || '消息过滤规则已保存', 'success');
+        resetMessageFilterForm();
+        await loadMessageFilters(editingId > 0 ? (messageFilterState.page || 1) : 1);
+    } catch (error) {
+        console.error('保存消息过滤规则失败:', error);
+    }
+}
+
+function editMessageFilterRule(encodedRecord) {
+    try {
+        const record = JSON.parse(decodeURIComponent(encodedRecord));
+        messageFilterState.editingId = Number(record.id || 0);
+        const formTitle = document.getElementById('messageFilterFormTitle');
+        if (formTitle) formTitle.textContent = '编辑过滤规则';
+        const fields = {
+            messageFilterRuleId: record.id || '',
+            messageFilterName: record.name || '',
+            messageFilterCookieId: record.cookie_id || '',
+            messageFilterItemId: record.item_id || '',
+            messageFilterMatchType: record.match_type || 'contains',
+            messageFilterSource: record.message_source || 'user',
+            messageFilterPatterns: Array.isArray(record.patterns) ? record.patterns.join('\n') : (record.patterns_text || ''),
+            messageFilterPauseMinutes: record.action_pause_minutes || 0
+        };
+        Object.entries(fields).forEach(([id, value]) => {
+            const element = document.getElementById(id);
+            if (element) element.value = value;
+        });
+        const checks = {
+            messageFilterEnabled: record.is_enabled,
+            messageFilterSkipAutoReply: record.action_skip_auto_reply,
+            messageFilterSkipAiReply: record.action_skip_ai_reply,
+            messageFilterNotify: record.action_notify
+        };
+        Object.entries(checks).forEach(([id, checked]) => {
+            const element = document.getElementById(id);
+            if (element) element.checked = Boolean(checked);
+        });
+        document.getElementById('messageFilterName')?.focus();
+    } catch (error) {
+        console.error('编辑消息过滤规则失败:', error);
+        showToast('加载规则失败', 'danger');
+    }
+}
+
+function resetMessageFilterForm() {
+    const form = document.getElementById('messageFilterForm');
+    if (form) form.reset();
+    messageFilterState.editingId = null;
+    const ruleId = document.getElementById('messageFilterRuleId');
+    if (ruleId) ruleId.value = '';
+    const formTitle = document.getElementById('messageFilterFormTitle');
+    if (formTitle) formTitle.textContent = '新增过滤规则';
+    const enabled = document.getElementById('messageFilterEnabled');
+    const skipAuto = document.getElementById('messageFilterSkipAutoReply');
+    const skipAi = document.getElementById('messageFilterSkipAiReply');
+    const notify = document.getElementById('messageFilterNotify');
+    const pause = document.getElementById('messageFilterPauseMinutes');
+    const matchType = document.getElementById('messageFilterMatchType');
+    const source = document.getElementById('messageFilterSource');
+    if (enabled) enabled.checked = true;
+    if (skipAuto) skipAuto.checked = true;
+    if (skipAi) skipAi.checked = false;
+    if (notify) notify.checked = false;
+    if (pause) pause.value = '0';
+    if (matchType) matchType.value = 'contains';
+    if (source) source.value = 'user';
+}
+
+async function toggleMessageFilter(ruleId, isEnabled) {
+    try {
+        await fetchJSON(`${apiBase}/api/message-filters/${ruleId}/toggle`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ is_enabled: Boolean(isEnabled) })
+        });
+        showToast(isEnabled ? '规则已启用' : '规则已禁用', 'success');
+    } catch (error) {
+        console.error('更新消息过滤规则状态失败:', error);
+        await loadMessageFilters(messageFilterState.page || 1);
+    }
+}
+
+async function deleteMessageFilter(ruleId) {
+    if (!confirm('确定删除这条消息过滤规则吗？')) return;
+    try {
+        const result = await fetchJSON(`${apiBase}/api/message-filters/${ruleId}`, {
+            method: 'DELETE'
+        });
+        showToast(result?.message || '消息过滤规则已删除', 'success');
+        if (Number(messageFilterState.editingId || 0) === Number(ruleId || 0)) {
+            resetMessageFilterForm();
+        }
+        await loadMessageFilters(messageFilterState.page || 1);
+    } catch (error) {
+        console.error('删除消息过滤规则失败:', error);
+    }
+}
+
+function resetMessageFilterSearch() {
+    const keyword = document.getElementById('messageFilterKeyword');
+    if (keyword) keyword.value = '';
+    loadMessageFilters(1);
 }
 
 // ================================
@@ -9705,6 +10083,7 @@ const DEFAULT_MENU_ITEMS = [
     { id: 'items', name: '商品管理', icon: 'bi-box-seam', required: false },
     { id: 'orders', name: '订单管理', icon: 'bi-receipt-cutoff', required: false },
     { id: 'auto-reply', name: '自动回复', icon: 'bi-chat-left-text', required: false },
+    { id: 'message-filters', name: '消息过滤', icon: 'bi-funnel', required: false },
     { id: 'items-reply', name: '指定商品回复', icon: 'bi-chat-left-text', required: false },
     { id: 'cards', name: '卡券管理', icon: 'bi-credit-card', required: false },
     { id: 'auto-delivery', name: '自动发货', icon: 'bi-truck', required: false },
@@ -16225,7 +16604,7 @@ function getOrderStatusText(status) {
         'pending_payment': '待付款',
         'pending_ship': '待发货',
         'partial_success': '部分发货',
-        'partial_pending_finalize': '部分待收尾',
+        'partial_pending_finalize': '待补确认',
         'shipped': '已发货',
         'completed': '交易成功',
         'success': '交易成功',

@@ -22739,17 +22739,38 @@ async function hydrateChatUserInfos(sessions) {
     }
 }
 
+function resolveSessionMessagePreview(session) {
+    const messagePreview = normalizeChatSessionPreview(session?.content, session?.content_type);
+    if (messagePreview && messagePreview !== '[系统/占位消息]' && messagePreview !== '[暂无文本内容]') {
+        return messagePreview;
+    }
+    return '';
+}
+
 function resolveSessionPreview(session) {
-    return session?.item_title
+    return resolveSessionMessagePreview(session)
         || session?.order_status_name
-        || normalizeChatSessionPreview(session?.content, session?.content_type);
+        || session?.item_title
+        || '[暂无文本内容]';
+}
+
+function resolveSessionSubMeta(session) {
+    const preview = resolveSessionPreview(session);
+    const parts = [];
+    [session?.item_title, session?.order_status_name, session?.item_tips].forEach(value => {
+        const text = String(value || '').trim();
+        if (text && text !== preview && !parts.includes(text)) {
+            parts.push(text);
+        }
+    });
+    return parts.join(' · ');
 }
 
 function getChatSessionState(session) {
     return {
         tag: '',
         preview: resolveSessionPreview(session),
-        submeta: session?.order_status_name || session?.item_tips || '',
+        submeta: resolveSessionSubMeta(session),
         className: ''
     };
 }
@@ -22781,9 +22802,9 @@ function scoreChatSession(session) {
 
 function sortChatSessions(sessions) {
     return [...(sessions || [])].sort((a, b) => {
-        const scoreDiff = scoreChatSession(b) - scoreChatSession(a);
-        if (scoreDiff !== 0) return scoreDiff;
-        return String(b?.created_at || '').localeCompare(String(a?.created_at || ''));
+        const timeDiff = String(b?.created_at || b?.lastMessageTime || '').localeCompare(String(a?.created_at || a?.lastMessageTime || ''));
+        if (timeDiff !== 0) return timeDiff;
+        return scoreChatSession(b) - scoreChatSession(a);
     });
 }
 
@@ -23006,7 +23027,7 @@ function renderChatSessions(sessions) {
         const avatar = resolveSessionAvatar(session);
         const sessionState = getChatSessionState(session);
         const preview = String(sessionState.preview || resolveSessionPreview(session)).substring(0, 42);
-        const baseSubMeta = String(sessionState.submeta || session.item_title || '').trim();
+        const baseSubMeta = String(sessionState.submeta || '').trim();
         const priceMeta = session.item_price ? `<span class="chat-session-price">￥${escapeHtml(String(session.item_price))}</span>` : '';
         const unread = Number(session.unread_count || 0);
         const sourceTag = session.source === 'remote_im' ? '<span class="chat-session-source">IM</span>' : '';
